@@ -1,0 +1,46 @@
+# Pole Navigation Configuration
+
+# Camera Settings
+camera:
+  device: 0                    # Camera device ID or path (/dev/video0)
+  width: 1920
+  height: 1080
+
+# LiDAR Settings
+lidar:
+  enabled: false               # Set to true when LiDAR is connected
+  ip: "192.168.1.10"          # LiDAR IP address
+  port: 2368                   # UDP port
+  min_range: 2.0              # Minimum detection range (meters)
+  max_range: 100.0            # Maximum detection range (meters)
+
+# YOLO Detection
+yolo:
+  model: "models/best.pt"     # Path to YOLO weights
+  confidence: 0.3              # Detection confidence threshold
+  use_gpu: true               # Use GPU acceleration
+
+# Fusion Settings
+fusion:
+  prefer_lidar: true          # Prefer LiDAR over camera when available
+  min_poles: 2                # Minimum poles for centerline
+
+# Guidance Settings
+guidance:
+  max_lateral_velocity: 2.0   # m/s
+  max_angular_velocity: 0.5   # rad/s
+  lateral_gain: 0.5
+  heading_gain: 1.0
+
+# Output Settings
+output:
+  save_video: true
+  video_path: "/data/fusion_output.mp4"
+  save_screenshots: true
+  screenshot_dir: "/data/screenshots"
+
+# Performance
+performance:
+  target_fps: 30
+  downsample_lidar: 5         # Process every Nth point
+  visualization: true          # Show live window
