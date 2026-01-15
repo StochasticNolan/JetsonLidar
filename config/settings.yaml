@@ -28,10 +28,49 @@ fusion:
 
 # Guidance Settings
 guidance:
-  max_lateral_velocity: 2.0   # m/s
-  max_angular_velocity: 0.5   # rad/s
-  lateral_gain: 0.5
-  heading_gain: 1.0
+  # CubeOrange+ connection
+  connection: '/dev/ttyACM0'   # Serial port (or 'udp:127.0.0.1:14550' for SITL)
+  baud_rate: 57600             # Serial baud rate
+
+  # Velocity limits
+  max_forward_velocity: 2.0    # m/s
+  max_lateral_velocity: 1.0    # m/s
+  max_vertical_velocity: 0.5   # m/s
+  max_angular_velocity: 0.5    # rad/s (yaw rate)
+
+  # Controller gains (PD)
+  lateral_gain: 0.5            # P gain for lateral error
+  lateral_d_gain: 0.1          # D gain for lateral error
+  heading_gain: 1.0            # P gain for heading error
+  heading_d_gain: 0.2          # D gain for heading error
+
+  # Pure pursuit
+  use_pure_pursuit: true       # Use pure pursuit vs PD controller
+  look_ahead_distance: 3.0     # meters
+
+  # State machine
+  min_confidence_follow: 0.5   # Min confidence to stay in FOLLOW
+  rescan_timeout: 5.0          # Seconds in RESCAN before ABORT
+  search_timeout: 30.0         # Seconds in SEARCH before ABORT
+
+  # Failsafe
+  heartbeat_timeout: 2.0       # Seconds without FCU heartbeat = failsafe
+  command_timeout: 0.5         # Seconds without perception update = hold
+
+  # Obstacle detection failsafe
+  obstacle_stop_distance: 3.0   # Full stop distance (m)
+  obstacle_slow_distance: 8.0   # Start slowing distance (m)
+  obstacle_clear_distance: 5.0  # Distance to resume after stop (m)
+
+# Obstacle Detection (corridor check)
+obstacle_detection:
+  enabled: true
+  corridor_length: 15.0        # How far ahead to check (m)
+  corridor_width: 2.0          # Half-width of corridor (m)
+  altitude_min: -1.0           # Vertical band min (m relative to drone)
+  altitude_max: 2.0            # Vertical band max (m)
+  min_obstacle_points: 10      # Min points to consider an obstacle
+  danger_distance: 5.0         # Distance for high-priority alert (m)
 
 # Output Settings
 output:
@@ -45,3 +84,201 @@ performance:
   target_fps: 30
   downsample_lidar: 5         # Process every Nth point
   visualization: true          # Show live window
+
+# Pole Detection (LiDAR) - used by perception_nav/src/pole_detector.py
+pole_detector:
+  # Performance tuning (for real-time on Jetson)
+  downsample_factor: 10        # Process every Nth point (aggressive for speed)
+  max_points: 5000             # Max points after downsampling
+
+  # RANSAC ground removal
+  ransac_threshold: 0.05       # Inlier distance threshold (meters)
+  ransac_iterations: 20        # Max RANSAC iterations
+  ransac_sample_size: 300      # Max ground candidates for RANSAC fitting
+  ground_height_margin: 0.1    # Height above ground to keep (meters)
+
+  # DBSCAN clustering
+  cluster_eps: 0.5             # Neighborhood radius (meters) - larger eps = faster but coarser
+  cluster_min_samples: 5       # Minimum points per cluster (after downsampling)
+
+  # Cylinder validation
+  pole_min_height: 0.5         # Min pole height (meters)
+  pole_max_height: 20.0        # Max pole height (meters)
+  pole_min_radius: 0.05        # Min pole radius (meters)
+  pole_max_radius: 0.3         # Max pole radius (meters)
+  pole_verticality: 0.85       # Min cos(angle) with Z axis
+  pole_min_aspect: 3.0         # Min height/diameter ratio
+
+  # Performance limits
+  max_clusters: 15             # Max clusters to process
+  max_points_per_cluster: 100  # Subsample large clusters
+
+  # Range limits
+  min_range: 0.5               # Min detection range (meters)
+  max_range: 50.0              # Max detection range (meters)
+
+  # Tracking (Kalman filter)
+  track_max_age: 10            # Frames before dropping track
+  track_min_hits: 3            # Hits before confirmed track
+  track_association_threshold: 1.0  # Max distance for association (meters)
+
+  # Moving object rejection (FMCW velocity filtering)
+  velocity_filter_enabled: true
+  max_point_velocity: 0.5      # Max velocity for individual points (m/s)
+  max_cluster_velocity: 0.3    # Max median velocity for clusters (m/s)
+  velocity_outlier_ratio: 0.2  # Max ratio of high-velocity points in cluster
+
+  # Ground plane stability
+  ground_plane_smoothing: 0.7  # EMA factor (0=none, 1=max smoothing)
+
+# Sensor Fusion - combines LiDAR + Camera detections
+sensor_fusion:
+  # Camera intrinsics (for 1280x720 USB camera - adjust after calibration)
+  camera_fx: 800.0             # Focal length X (pixels)
+  camera_fy: 800.0             # Focal length Y (pixels)
+  camera_cx: 640.0             # Principal point X (pixels)
+  camera_cy: 360.0             # Principal point Y (pixels)
+
+  # Camera-LiDAR extrinsics (transform from LiDAR to camera frame)
+  # Adjust these based on your physical sensor mounting
+  extrinsic_tx: 0.0            # Translation X (forward) in meters
+  extrinsic_ty: 0.0            # Translation Y (left) in meters
+  extrinsic_tz: -0.1           # Translation Z (up) in meters - camera above LiDAR
+  extrinsic_roll: 0.0          # Roll (degrees)
+  extrinsic_pitch: 0.0         # Pitch (degrees)
+  extrinsic_yaw: 0.0           # Yaw (degrees)
+
+  # Association thresholds
+  association_threshold_px: 150.0  # Max pixel distance for LiDAR-camera matching
+
+  # Confidence weighting
+  weight_lidar: 0.6            # Weight for LiDAR confidence
+  weight_camera: 0.4           # Weight for camera confidence
+  camera_boost: 0.2            # Confidence boost when camera matches
+
+  # Temporal filtering
+  temporal_window: 10          # Frames to track history
+  min_frames_seen: 2           # Min frames before outputting pole
+  camera_hold_frames: 5        # Frames to retain camera match status
+
+  # Output gating
+  min_fused_confidence: 0.3    # Min confidence to output fused pole
+
+# Line Follower - follows single line of utility poles
+line_follower:
+  # Lateral offset - which side to fly and how far from poles
+  lateral_offset: 10.0         # Distance to maintain from pole line (m)
+  fly_on_left: true            # true = fly left of poles, false = fly right
+
+  # Pole line fitting
+  min_poles_for_line: 1        # Min poles to estimate line (1 = follow single pole)
+  max_pole_range: 150.0        # Max range to consider poles (m)
+  smoothing_alpha: 0.3         # EMA smoothing (0=none, 1=max)
+
+  # Look-ahead for path following
+  look_ahead_distance: 20.0    # Look-ahead distance (m)
+  min_look_ahead: 5.0          # Minimum look-ahead (m)
+
+  # Pole spacing (H-frame utility poles typically 50-100m apart)
+  expected_pole_spacing: 75.0  # Expected distance between poles (m)
+  max_pole_gap: 200.0          # Max gap before assuming missing pole (m)
+
+  # Capture triggering
+  approach_distance: 20.0      # Start slowing this far from pole (m)
+  capture_distance: 10.0       # Trigger capture at this distance (m)
+
+  # Confidence
+  min_confidence: 0.3          # Min confidence for valid navigation
+
+# Tesla-Style Smooth Controller (100Hz control loop)
+smooth_controller:
+  # Control loop
+  control_rate_hz: 100.0       # High-frequency control (Hz)
+  perception_timeout: 0.5      # Max age of perception data (s)
+
+  # Path following
+  lateral_offset: 10.0         # Distance from pole line (m)
+  fly_on_left: true            # Which side to fly
+
+  # Dynamic look-ahead (look_ahead = base + speed * gain)
+  look_ahead_base: 3.0         # Minimum look-ahead (m)
+  look_ahead_gain: 1.5         # Seconds ahead to look
+  look_ahead_max: 30.0         # Maximum look-ahead (m)
+
+  # Velocity limits
+  max_speed: 5.0               # Max forward speed (m/s)
+  cruise_speed: 3.0            # Normal cruise speed (m/s)
+  min_speed: 0.5               # Minimum speed (m/s)
+
+  # Acceleration limits (for smooth motion)
+  max_accel: 1.0               # Max acceleration (m/s^2)
+  max_decel: 1.5               # Max deceleration (m/s^2)
+  max_jerk: 2.0                # Max jerk for smoothness (m/s^3)
+
+  # Lateral control
+  max_lateral_accel: 1.0       # Max lateral acceleration (m/s^2)
+  max_yaw_rate: 0.5            # Max yaw rate (rad/s)
+  max_yaw_accel: 0.5           # Max yaw acceleration (rad/s^2)
+
+  # Controller gains
+  lateral_p: 0.8               # Proportional gain
+  lateral_d: 0.3               # Derivative gain
+  heading_p: 1.2               # Heading proportional
+  heading_d: 0.4               # Heading derivative
+
+  # Predictive control (MPC-lite)
+  prediction_horizon: 1.0      # How far ahead to predict (s)
+  prediction_steps: 10         # Steps in prediction
+
+  # Path smoothing
+  spline_smoothing: 0.5        # Spline smoothing factor
+  path_history_size: 20        # Poles to keep in history
+
+  # Curvature-based speed reduction
+  curvature_speed_gain: 2.0    # Slow down in curves
+  min_curve_radius: 5.0        # Min radius for full speed (m)
+
+# Jetson GPS Module
+gps:
+  enabled: true
+  port: '/dev/ttyUSB1'         # USB GPS serial port
+  baud: 9600                   # Baud rate (9600 for most GPS)
+  min_satellites: 4            # Minimum satellites for valid fix
+  update_rate_hz: 5            # GPS update rate
+  smoothing_alpha: 0.3         # Position smoothing (0=none, 1=max)
+  max_age: 2.0                 # Max position age before stale (s)
+
+# Mission Management
+mission:
+  default_pattern: "line_follow"   # Default search pattern
+
+# Pole Inspection
+inspection:
+  min_fused_confidence: 0.6        # Min confidence to inspect
+  min_frames_tracked: 10           # Min frames for stable track
+  camera_match_required: true      # Require YOLO confirmation
+  capture_distance: 10.0           # Ideal capture distance (m)
+  max_approach_distance: 5.0       # Don't get closer than this (m)
+  min_approach_distance: 15.0      # Must be at least this close (m)
+  dwell_time: 2.0                  # Hover time for capture (s)
+  photos_per_pole: 1               # Photos to take per pole
+  dedup_grid_resolution: 5.0       # Spatial dedup grid (m)
+  dedup_distance_threshold: 10.0   # Min distance between poles (m)
+
+# Stop Conditions
+stop_conditions:
+  max_poles: 0                     # 0 = unlimited
+  max_time_minutes: 0              # 0 = unlimited
+  min_battery_percent: 20.0        # Return when battery hits this
+  coverage_threshold: 0.95         # Coverage % to complete (0-1)
+  max_distance_from_home: 0        # 0 = unlimited, meters
+
+# AeroSync Integration
+aerosync:
+  base_url: "https://aerosync.example.com"
+  api_key: ""                      # Set in environment or here
+  websocket_enabled: true          # Real-time WebSocket updates
+  upload_photos: true              # Upload photos to AeroSync
+  position_update_rate_hz: 1.0     # Position update frequency
+  retry_max_attempts: 3            # API retry attempts
+  timeout_seconds: 30.0            # API timeout

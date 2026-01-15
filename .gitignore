@@ -1,0 +1,47 @@
+# Build artifacts
+build/
+__pycache__/
+*.pyc
+*.pyo
+*.so
+*.o
+
+# Large files / documentation
+*.pdf
+*.PDF
+*.MP4
+*.mp4
+*.tar.xz
+*.tar.gz
+*.zip
+
+# Runtime data
+captures/
+flight_captures/
+output/
+*.bag
+
+# API examples build artifacts
+api_examples/*/build/
+ros_examples/build/
+ros2_examples/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+venv/
+env/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.log
