@@ -18,6 +18,76 @@
 - S3 presigned URL upload flow implemented
 - Data formats match AeroSync backend expectations
 
+### 🔧 Required Jetson Code Fixes (Jan 16, 2026)
+
+**Status:** AeroSync backend has been updated with all required endpoints. The following Jetson code changes are needed for full compatibility:
+
+#### Fix #1: Send Drone Position Metadata in Photo Confirmation
+
+**File:** `perception_nav/src/aerosync_client.py` (around line 433)
+
+**Issue:** Photo confirmation doesn't include drone position/heading when photo was captured
+
+**Required Change:**
+```python
+def confirm_photo_upload(self, job_id: str, pole_id: str,
+                          photo_id: str, s3_key: str,
+                          lat: float = None, lon: float = None,
+                          drone_lat: float = None, drone_lon: float = None,
+                          drone_alt: float = None, drone_heading: float = None,
+                          captured_at: str = None) -> bool:
+    """Confirm photo upload with drone position metadata."""
+    url = f"{self.config.base_url}/api/drone/jobs/{job_id}/poles/{pole_id}/photo/confirm"
+    payload = {
+        'photo_id': photo_id,
+        's3_key': s3_key,
+        'lat': lat,  # Pole GPS
+        'lon': lon,
+        'drone_lat': drone_lat,  # REQUIRED: Current drone latitude
+        'drone_lon': drone_lon,  # REQUIRED: Current drone longitude
+        'drone_alt': drone_alt,  # REQUIRED: Current drone altitude
+        'drone_heading': drone_heading,  # REQUIRED: Current drone heading
+        'captured_at': captured_at  # REQUIRED: ISO8601 timestamp
+    }
+    self._request_with_retry('POST', url, json=payload)
+    return True
+```
+
+**Impact:** Without this, photo records won't have drone position data (needed for flight path reconstruction)
+
+---
+
+#### Fix #2: Update Calling Code to Pass Drone Metadata
+
+**File:** Wherever `aerosync_client.confirm_photo_upload()` is called (likely `capture_system.py` or `mission_executor.py`)
+
+**Required Change:**
+```python
+# Get current drone state from flight controller
+current_lat, current_lon = guidance.get_gps_position()
+current_alt = guidance.get_altitude()
+current_heading = guidance.get_heading()
+
+# Confirm photo upload with full metadata
+success = aerosync_client.confirm_photo_upload(
+    job_id=job_id,
+    pole_id=pole_id,
+    photo_id=photo_id,
+    s3_key=s3_key,
+    lat=pole_gps[0],  # Pole GPS (from detection)
+    lon=pole_gps[1],
+    drone_lat=current_lat,  # Drone GPS (at capture time)
+    drone_lon=current_lon,
+    drone_alt=current_alt,
+    drone_heading=current_heading,
+    captured_at=datetime.utcnow().isoformat() + 'Z'
+)
+```
+
+**Impact:** Critical for flight path reconstruction, photo analysis, and debugging
+
+---
+
 See [AEROSYNC_SPEC.md](./AEROSYNC_SPEC.md) for complete API reference.
 
 ---
