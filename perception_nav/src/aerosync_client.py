@@ -43,6 +43,13 @@ except ImportError:
     print("Warning: aiohttp not installed. Run: pip install aiohttp")
 
 try:
+    import socketio
+    SOCKETIO_AVAILABLE = True
+except ImportError:
+    SOCKETIO_AVAILABLE = False
+    print("Warning: python-socketio not installed. Run: pip install python-socketio")
+
+try:
     import requests
     REQUESTS_AVAILABLE = True
 except ImportError:
@@ -655,8 +662,9 @@ class AeroSyncClient:
 
     def _ws_loop(self, job_id: str):
         """WebSocket event loop (runs in background thread)."""
-        if not AIOHTTP_AVAILABLE:
-            print("Warning: aiohttp not available for WebSocket")
+        if not SOCKETIO_AVAILABLE:
+            print("Warning: python-socketio not available for WebSocket")
+            print("Install with: pip install python-socketio")
             return
 
         # Create new event loop for this thread
@@ -671,55 +679,83 @@ class AeroSyncClient:
             loop.close()
 
     async def _ws_handler(self, job_id: str):
-        """Async WebSocket handler."""
-        # WebSocket endpoint - AeroSync uses Socket.IO on root
-        ws_url = self.config.base_url.replace('https://', 'wss://').replace('http://', 'ws://')
-        # Socket.IO connects to root, then joins rooms via events
-        # For raw WebSocket fallback, use the job-specific endpoint
-        ws_url = f"{ws_url}/socket.io/?job_id={job_id}&type=drone"
+        """Async Socket.IO handler."""
+        # Create Socket.IO client
+        sio = socketio.AsyncClient()
 
-        headers = {'Authorization': f'Bearer {self.config.api_key}'}
+        # Register event handlers
+        @sio.on('connect')
+        async def on_connect():
+            print(f"Socket.IO connected to {self.config.base_url}")
+            # Join job room as drone
+            await sio.emit('join_job', {
+                'job_id': job_id,
+                'type': 'drone'
+            })
+
+        @sio.on('disconnect')
+        async def on_disconnect():
+            print("Socket.IO disconnected")
+
+        @sio.on('abort')
+        async def on_abort(data):
+            print(f"Received abort command: {data}")
+            if self._on_abort:
+                self._on_abort(data)
+
+        @sio.on('pause')
+        async def on_pause(data):
+            print(f"Received pause command: {data}")
+            if self._on_pause:
+                self._on_pause(data)
+
+        @sio.on('resume')
+        async def on_resume(data):
+            print(f"Received resume command: {data}")
+            if self._on_resume:
+                self._on_resume(data)
 
         while self._ws_running:
             try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.ws_connect(ws_url, headers=headers) as ws:
-                        print(f"WebSocket connected to {ws_url}")
+                # Connect to Socket.IO server
+                await sio.connect(
+                    self.config.base_url,
+                    auth={'api_key': self.config.api_key},
+                    wait_timeout=10
+                )
 
-                        # Start send task
-                        send_task = asyncio.create_task(self._ws_send_loop(ws))
+                # Start send loop
+                send_task = asyncio.create_task(self._ws_send_loop_socketio(sio))
 
-                        # Receive loop
-                        async for msg in ws:
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                await self._handle_ws_message(msg.data)
-                            elif msg.type == aiohttp.WSMsgType.ERROR:
-                                print(f"WebSocket error: {ws.exception()}")
-                                break
+                # Keep connection alive
+                while self._ws_running and sio.connected:
+                    await asyncio.sleep(1.0)
 
-                        send_task.cancel()
+                send_task.cancel()
+                await sio.disconnect()
 
             except Exception as e:
-                print(f"WebSocket connection error: {e}")
+                print(f"Socket.IO connection error: {e}")
 
             if self._ws_running:
                 await asyncio.sleep(5.0)  # Reconnect delay
 
-    async def _ws_send_loop(self, ws):
-        """Send queued messages to WebSocket."""
+    async def _ws_send_loop_socketio(self, sio):
+        """Send queued messages via Socket.IO."""
         while True:
             try:
                 # Check queue for messages to send
                 while not self._ws_queue.empty():
                     msg = self._ws_queue.get_nowait()
-                    await ws.send_str(json.dumps(msg))
+                    event = msg.get('event', 'drone_position')
+                    await sio.emit(event, msg)
 
                 await asyncio.sleep(0.1)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                print(f"WebSocket send error: {e}")
+                print(f"Socket.IO send error: {e}")
 
     async def _handle_ws_message(self, data: str):
         """Handle incoming WebSocket message.
