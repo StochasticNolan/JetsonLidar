@@ -1032,6 +1032,252 @@ Note: Use `geventwebsocket` worker for WebSocket support.
 
 ---
 
+## Jetson Drone Compatibility
+
+This section documents what the AeroSync backend must provide for successful integration with the Jetson drone system.
+
+### Required API Response Formats
+
+#### GET /api/drone/jobs/{id} Response
+
+The Jetson `mission_planner.py` expects these fields:
+
+```json
+{
+  "job_id": "string (required)",
+  "name": "string (required)",
+  "search_pattern": "line_follow | lawnmower | spiral (required)",
+  "search_area": {
+    "type": "Polygon",
+    "coordinates": [[[lon, lat], [lon, lat], ...]]
+  },
+  "search_config": {
+    "sweep_spacing": 50.0,
+    "flight_altitude": 30.0,
+    "speed": 5.0
+  },
+  "stop_conditions": {
+    "max_poles": 50,
+    "max_time_minutes": 30,
+    "min_battery_percent": 25.0,
+    "coverage_threshold": 0.9
+  },
+  "inspection_config": {
+    "min_confidence": 0.6,
+    "camera_required": true,
+    "capture_distance": 10.0,
+    "photos_per_pole": 1
+  },
+  "previously_inspected": [
+    {"lat": 41.318, "lon": -105.568, "pole_id": "optional"}
+  ],
+  "state": "pending | running | completed | aborted"
+}
+```
+
+**Important:**
+- `search_area` MUST be a valid GeoJSON Polygon
+- Polygon coordinates are `[lon, lat]` order (GeoJSON standard)
+- `search_config.flight_altitude` used as mission altitude
+- `search_config.speed` used as cruise speed
+
+#### POST /api/drone/jobs/{id}/poles Request
+
+Jetson sends poles in this format:
+
+```json
+{
+  "pole_id": "uuid-generated-by-drone",
+  "timestamp": "2026-01-16T14:40:23Z",
+  "position": {
+    "latitude": 41.12845,
+    "longitude": -105.46123,
+    "altitude_msl": 2050.5,
+    "altitude_agl": 12.3,
+    "local_x": 125.4,
+    "local_y": -8.2,
+    "local_z": 10.5
+  },
+  "detection": {
+    "confidence": 0.87,
+    "pole_type": "h_frame | metal_tree_pole | single_pole | wood_distribution | utility_pole",
+    "lidar_confidence": 0.92,
+    "camera_confidence": 0.81,
+    "height_estimate": 14.5,
+    "radius_estimate": 0.18
+  },
+  "metadata": {}
+}
+```
+
+**Backend should:**
+- Create Pin record with detection fields
+- Increment `jobs.poles_found`
+- Broadcast `pole_found` event to web clients
+
+#### PUT /api/drone/jobs/{id}/status Request
+
+Jetson sends status updates every 10-30 seconds:
+
+```json
+{
+  "state": "running",
+  "guidance_state": "IDLE | SEARCH | FOLLOW | RESCAN | OBSTACLE_STOP | ABORT",
+  "poles_inspected": 12,
+  "elapsed_minutes": 8.5,
+  "battery_percent": 85.2,
+  "coverage_percent": 0.35,
+  "distance_from_home": 450.0,
+  "current_position": {
+    "lat": 41.318285,
+    "lon": -105.568625,
+    "alt": 30.5
+  }
+}
+```
+
+#### POST /api/drone/jobs/{id}/complete Request
+
+```json
+{
+  "stop_reason": "coverage_complete | max_poles_reached | time_limit | low_battery | user_abort | failsafe | error",
+  "summary": {
+    "poles_inspected": 47,
+    "poles_skipped_duplicate": 3,
+    "duration_minutes": 28.5,
+    "final_battery_percent": 32.1,
+    "final_coverage_percent": 0.95
+  }
+}
+```
+
+### WebSocket Protocol
+
+#### Connection
+
+Jetson connects to Socket.IO endpoint and emits `join_job`:
+
+```javascript
+socket.emit('join_job', {
+  job_id: 123,
+  type: 'drone'
+});
+```
+
+Server should add drone to room `job_{id}_drone`.
+
+#### Drone → Server Events
+
+**drone_position** (1 Hz):
+
+```json
+{
+  "event": "drone_position",
+  "job_id": "123",
+  "lat": 41.318285,
+  "lon": -105.568625,
+  "alt": 30.5,
+  "heading": 45.2,
+  "speed": 3.5,
+  "battery": 85.2,
+  "timestamp": 1705412423.456
+}
+```
+
+Server should broadcast to `job_{id}_web` room.
+
+#### Server → Drone Events
+
+**abort** - Must be sent when operator clicks abort button:
+
+```json
+{
+  "event": "abort",
+  "job_id": "123"
+}
+```
+
+Jetson will immediately trigger RTL.
+
+### S3 Upload Requirements
+
+#### GET /api/drone/jobs/{id}/poles/{pole_id}/photo/upload-url
+
+Response MUST include:
+
+```json
+{
+  "upload_url": "https://s3.amazonaws.com/bucket/key?X-Amz-Signature=...",
+  "photo_id": "uuid",
+  "s3_key": "jobs/123/poles/789/photo_1705412423.jpg",
+  "expires_in": 300
+}
+```
+
+- `upload_url` must be a valid S3 presigned PUT URL
+- URL must allow `Content-Type: image/jpeg`
+- Expiration should be at least 60 seconds (300 recommended)
+
+#### POST /api/drone/jobs/{id}/poles/{pole_id}/photo/confirm
+
+Request:
+
+```json
+{
+  "photo_id": "uuid-from-upload-url-response",
+  "s3_key": "jobs/123/poles/789/photo_1705412423.jpg"
+}
+```
+
+Server should:
+1. Create Photo record in database
+2. Trigger thumbnail generation
+3. Broadcast `photo_ready` event to web clients
+
+### Error Handling
+
+Jetson expects these HTTP status codes:
+
+| Status | Meaning | Jetson Behavior |
+|--------|---------|-----------------|
+| 200 | Success | Continue |
+| 201 | Created | Continue |
+| 400 | Bad request | Log error, retry |
+| 401 | Unauthorized | Stop mission, alert |
+| 404 | Not found | Log error, continue |
+| 500 | Server error | Retry with backoff |
+
+### Testing with Jetson
+
+To test AeroSync with the Jetson simulator:
+
+```bash
+# On Jetson
+python3 perception_nav/src/mission_executor.py
+
+# Or use the test script
+python3 -c "
+from perception_nav.src.aerosync_client import AeroSyncClient
+client = AeroSyncClient()
+job = client.fetch_job('test-job-id')
+print(job)
+"
+```
+
+### Checklist for Jetson Compatibility
+
+- [ ] GET `/api/drone/jobs/{id}` returns all required fields
+- [ ] `search_area` is valid GeoJSON Polygon with `[lon, lat]` coordinates
+- [ ] POST `/api/drone/jobs/{id}/poles` accepts pole report format
+- [ ] PUT `/api/drone/jobs/{id}/status` accepts status format
+- [ ] POST `/api/drone/jobs/{id}/complete` accepts summary format
+- [ ] WebSocket `abort` event sent to drone room on abort
+- [ ] S3 presigned URL generation working
+- [ ] Photo confirm endpoint creates Photo record
+- [ ] `photo_ready` event broadcast on upload confirmation
+
+---
+
 ## Support & References
 
 **Repository:** `/Users/nolannachbar/Testing:Dev/AeroSync`

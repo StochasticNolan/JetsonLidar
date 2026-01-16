@@ -118,23 +118,112 @@ Tesla-style high-performance path following.
 - **MPC-lite predictive control**: Anticipates path curvature
 - **Curvature-based speed**: Slows down in curves
 
-### 7. Capture Scheduler - NOT IMPLEMENTED
+### 7. Mission Planning - DONE
 
-Planned features:
-- Trigger capture at designated poles
-- ROI gating (pole in camera FOV)
-- Ring buffer for frame latency
-- Capture signal coordination
+`perception_nav/src/mission_planner.py`
 
-### 8. Data Bundling - NOT IMPLEMENTED
+Parses AeroSync job data and generates flight waypoints.
 
-Planned features:
-- Folder per pole: `captures/{timestamp}_{pole_id}/`
-- Contents: `image.jpg`, `points.pcd`, `metadata.json`
-- Schema validation
+- **Mission Parser**: Converts AeroSync JSON to Mission dataclass
+- **Waypoint Generation**: Three search patterns supported
+  - `line_follow`: Single start waypoint, Jetson follows poles autonomously
+  - `lawnmower`: Parallel north-south sweeps across polygon (starts from closest corner)
+  - `spiral`: Outward spiral from polygon center
+- **Closest Corner Start**: Automatically finds closest corner of search area to home position
+- **Mission Validation**: Checks altitude, speed, polygon closure, area size
+- **GeoJSON Support**: Parses polygon coordinates from GeoJSON format
+- **Coordinate Utils**: Haversine distance, meters-to-degrees conversions
+
+**Usage:**
+```python
+from perception_nav.src.mission_planner import parse_mission, generate_waypoints, validate_mission, compute_entry_point
+
+mission = parse_mission(job_data)
+valid, error = validate_mission(mission)
+entry_point = compute_entry_point(mission)  # Closest corner to home
+waypoints = generate_waypoints(mission)
+```
+
+**Output**: `Mission`, `Waypoint`, `SearchConfig`, `InspectionConfig` dataclasses
+
+### 8. Flight Control - DONE
+
+`perception_nav/src/guidance.py` - High-level flight commands
+
+- **takeoff(altitude)**: Arms, sets GUIDED mode, takes off to altitude
+- **navigate_to_waypoint(lat, lon, alt)**: GPS waypoint navigation with arrival detection
+- **return_to_launch()**: Commands RTL mode
+- **land()**: Commands LAND mode
+- **hold_position()**: Zero-velocity hold
+
+**GPS Telemetry**: Now tracks GPS position, altitude, heading, and battery from FCU
+
+### 9. Mission Executor - DONE
+
+`perception_nav/src/mission_executor.py`
+
+Orchestrates complete autonomous missions end-to-end.
+
+**Execution Flow:**
+1. Fetch mission from AeroSync
+2. Parse and validate mission
+3. Takeoff to mission altitude
+4. Navigate to closest corner of search area
+5. Execute search pattern (lawnmower → line-follow when poles found)
+6. Report poles to AeroSync
+7. Capture photos and upload
+8. Monitor stop conditions
+9. Return to launch
+10. Land
+
+**Usage:**
+```python
+from perception_nav.src.mission_executor import MissionExecutor
+
+executor = MissionExecutor(config_path='config/settings.yaml')
+executor.initialize()
+executor.connect_fcu('/dev/ttyACM0')
+await executor.run_mission('job-uuid')
+```
+
+**States**: IDLE → FETCHING_MISSION → VALIDATING → TAKEOFF → TRANSIT_TO_AREA → SEARCHING → LINE_FOLLOWING → RETURNING → LANDING → COMPLETED
+
+### 10. Capture Scheduler - PARTIAL
+
+`perception_nav/src/capture_system.py`
+
+Infrastructure implemented:
+- Ring buffer for frame history
+- Async data bundler (non-blocking)
+- Capture event scheduling
+- Obstacle detection integration
+
+Needs verification:
+- Integration with main loop
+- ROI gating
+
+### 11. Data Bundling - PARTIAL
+
+Infrastructure in `capture_system.py`:
+- Async file I/O worker thread
+- Metadata JSON with detections
 - MD5 checksums
+- Directory structure per capture
 
-### 9. Failsafes - DONE
+### 12. S3 Photo Upload - DONE
+
+`perception_nav/src/aerosync_client.py` - S3 presigned URL upload flow
+
+- **get_photo_upload_url()**: Request presigned URL from AeroSync
+- **upload_to_s3()**: Direct PUT to S3 with presigned URL
+- **confirm_photo_upload()**: Confirm upload completion
+- **upload_photo_s3()**: Complete flow with retry logic
+
+**Two upload options:**
+1. Direct upload via `upload_photo()` (multipart to AeroSync)
+2. S3 presigned URL via `upload_photo_s3()` (3-step flow)
+
+### 13. Failsafes - DONE
 
 | Condition | Response | Status |
 |-----------|----------|--------|
@@ -167,8 +256,14 @@ JetsonLidar/
 │       ├── pole_detector.py   # LiDAR pole extraction + tracking
 │       ├── fusion.py          # LiDAR + camera fusion
 │       ├── line_follower.py   # Single-line pole following
-│       ├── guidance.py        # MAVLink velocity commands
-│       └── smooth_controller.py # 100Hz Tesla-style control
+│       ├── guidance.py        # MAVLink commands + flight control
+│       ├── smooth_controller.py # 100Hz Tesla-style control
+│       ├── mission_planner.py # Mission parser + waypoint generation
+│       ├── mission_manager.py # Mission state + stop conditions
+│       ├── mission_executor.py # Full autonomous mission orchestration
+│       ├── aerosync_client.py # AeroSync REST + WebSocket + S3 upload
+│       ├── capture_system.py  # Photo capture + data bundling
+│       └── gps_reader.py      # GPS module interface
 ├── yolov5/                    # YOLO model and inference
 └── build/
     └── aeva_simple_bridge     # LiDAR ROS bridge

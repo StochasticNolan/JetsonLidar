@@ -378,6 +378,19 @@ class MavlinkGuidance:
                     elif msg_type == 'ATTITUDE':
                         self._attitude = (msg.roll, msg.pitch, msg.yaw)
 
+                    elif msg_type == 'GLOBAL_POSITION_INT':
+                        # GPS position in degrees (lat/lon scaled by 1e7)
+                        self._gps_lat = msg.lat / 1e7
+                        self._gps_lon = msg.lon / 1e7
+                        self._gps_alt = msg.relative_alt / 1000.0  # mm to m (relative to home)
+                        self._gps_heading = msg.hdg / 100.0  # cdeg to deg
+
+                    elif msg_type == 'SYS_STATUS':
+                        # Battery status
+                        if msg.battery_remaining >= 0:
+                            self._battery_percent = msg.battery_remaining
+                        self._battery_voltage = msg.voltage_battery / 1000.0  # mV to V
+
                     elif msg_type == 'RC_CHANNELS':
                         # Store all RC channels
                         self._rc_channels = [
@@ -528,6 +541,239 @@ class MavlinkGuidance:
         self.in_offboard = False
         self.state = GuidanceState.ABORT
         return True
+
+    # =========================================================================
+    # High-Level Flight Commands (Takeoff, Navigate, Land)
+    # =========================================================================
+
+    def takeoff(self, altitude: float, timeout: float = 60.0) -> bool:
+        """Arm and takeoff to specified altitude.
+
+        Sets GUIDED mode, arms the vehicle, and commands takeoff to the
+        specified altitude AGL. Blocks until altitude is reached or timeout.
+
+        Args:
+            altitude: Target altitude above ground level (meters)
+            timeout: Maximum time to wait for takeoff (seconds)
+
+        Returns:
+            True if takeoff successful and altitude reached
+        """
+        if not self.mav or not self.connected:
+            print("Not connected to FCU")
+            return False
+
+        print(f"Takeoff sequence to {altitude}m")
+
+        # 1. Set GUIDED mode
+        if not self.set_guided_mode():
+            print("Failed to set GUIDED mode")
+            return False
+        time.sleep(0.5)
+
+        # 2. Arm
+        if not self.armed:
+            if not self.arm():
+                print("Failed to arm")
+                return False
+        time.sleep(0.5)
+
+        # 3. Send takeoff command
+        print(f"Commanding takeoff to {altitude}m...")
+        self.mav.mav.command_long_send(
+            self.mav.target_system,
+            self.mav.target_component,
+            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+            0,                  # confirmation
+            0,                  # param1: pitch (ignored for copter)
+            0,                  # param2: empty
+            0,                  # param3: empty
+            float('nan'),       # param4: yaw (NaN = current heading)
+            0,                  # param5: latitude (0 = current)
+            0,                  # param6: longitude (0 = current)
+            altitude            # param7: altitude (m)
+        )
+
+        # 4. Wait for altitude
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            # Get current altitude from telemetry
+            current_alt = self._position[2]  # Z in local frame
+
+            # Check if we've reached target (within 5%)
+            if current_alt >= altitude * 0.95:
+                print(f"Reached target altitude: {current_alt:.1f}m")
+                self.state = GuidanceState.IDLE
+                return True
+
+            # Progress update
+            if int(time.time() - start_time) % 2 == 0:
+                print(f"  Altitude: {current_alt:.1f}m / {altitude}m")
+
+            time.sleep(0.5)
+
+        print(f"Takeoff timeout - current altitude: {self._position[2]:.1f}m")
+        return False
+
+    def land(self) -> bool:
+        """Command vehicle to land at current location.
+
+        Returns:
+            True if land command sent successfully
+        """
+        if not self.mav:
+            return False
+
+        land_mode = 9  # LAND for ArduCopter
+
+        print("Commanding LAND...")
+        self.mav.mav.set_mode_send(
+            self.mav.target_system,
+            mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+            land_mode
+        )
+
+        self.in_offboard = False
+        self.state = GuidanceState.LANDED
+        return True
+
+    def navigate_to_waypoint(self, lat: float, lon: float, alt: float,
+                              speed: float = 3.0,
+                              threshold_m: float = 3.0,
+                              timeout: float = 300.0) -> bool:
+        """Navigate to GPS waypoint using ArduPilot's internal navigation.
+
+        Sends a GUIDED mode waypoint command and waits for arrival.
+        Requires GUIDED mode to be active.
+
+        Args:
+            lat: Target latitude (degrees)
+            lon: Target longitude (degrees)
+            alt: Target altitude AGL (meters)
+            speed: Cruise speed (m/s)
+            threshold_m: Arrival threshold (meters)
+            timeout: Maximum navigation time (seconds)
+
+        Returns:
+            True if waypoint reached within timeout
+        """
+        if not self.mav or not self.connected:
+            print("Not connected to FCU")
+            return False
+
+        if not self.is_guided_mode():
+            print("Not in GUIDED mode - cannot navigate")
+            return False
+
+        print(f"Navigating to ({lat:.6f}, {lon:.6f}) @ {alt}m")
+
+        # Set cruise speed
+        self.mav.mav.command_long_send(
+            self.mav.target_system,
+            self.mav.target_component,
+            mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED,
+            0,                  # confirmation
+            0,                  # speed type (0=airspeed, 1=groundspeed)
+            speed,              # speed (m/s)
+            -1,                 # throttle (-1 = no change)
+            0, 0, 0, 0
+        )
+
+        # Send position target (global frame)
+        # Convert altitude to AMSL if needed (here we assume AGL = AMSL for simplicity)
+        self.mav.mav.set_position_target_global_int_send(
+            0,                  # time_boot_ms
+            self.mav.target_system,
+            self.mav.target_component,
+            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+            0b0000111111111000,  # type_mask: use position only
+            int(lat * 1e7),     # lat_int
+            int(lon * 1e7),     # lon_int
+            alt,                # alt (relative to home)
+            0, 0, 0,            # velocity (ignored)
+            0, 0, 0,            # acceleration (ignored)
+            0,                  # yaw (ignored)
+            0                   # yaw_rate (ignored)
+        )
+
+        # Wait for arrival
+        start_time = time.time()
+        last_log_time = 0
+
+        while time.time() - start_time < timeout:
+            # Check if still in GUIDED mode
+            if not self.is_guided_mode():
+                print("Exited GUIDED mode - navigation aborted")
+                return False
+
+            # Calculate distance to target (simplified)
+            distance = self._distance_to_waypoint(lat, lon)
+
+            # Arrival check
+            if distance < threshold_m:
+                print(f"Arrived at waypoint (distance: {distance:.1f}m)")
+                return True
+
+            # Progress logging (every 5 seconds)
+            if time.time() - last_log_time > 5.0:
+                print(f"  Distance to waypoint: {distance:.0f}m")
+                last_log_time = time.time()
+
+            time.sleep(0.5)
+
+        print(f"Navigation timeout - distance: {self._distance_to_waypoint(lat, lon):.0f}m")
+        return False
+
+    def _distance_to_waypoint(self, target_lat: float, target_lon: float) -> float:
+        """Calculate approximate distance to waypoint in meters.
+
+        Uses local position if available, otherwise estimates from GPS.
+        """
+        # For now, use a simple approximation
+        # In practice, should use GPS telemetry from FCU
+        current_lat, current_lon = self.get_gps_position()
+        if current_lat == 0 and current_lon == 0:
+            return float('inf')  # No GPS fix
+
+        # Haversine approximation
+        import math
+        dlat = math.radians(target_lat - current_lat)
+        dlon = math.radians(target_lon - current_lon)
+        a = math.sin(dlat/2)**2 + \
+            math.cos(math.radians(current_lat)) * \
+            math.cos(math.radians(target_lat)) * \
+            math.sin(dlon/2)**2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+        return 6371000 * c  # Earth radius in meters
+
+    def get_gps_position(self) -> Tuple[float, float]:
+        """Get current GPS position.
+
+        Returns:
+            Tuple of (latitude, longitude) in degrees, or (0, 0) if unavailable
+        """
+        # This should be populated from GLOBAL_POSITION_INT messages
+        # For now, return placeholder - needs telemetry integration
+        return getattr(self, '_gps_lat', 0.0), getattr(self, '_gps_lon', 0.0)
+
+    def get_altitude(self) -> float:
+        """Get current altitude AGL in meters."""
+        return self._position[2]
+
+    def get_battery_percent(self) -> float:
+        """Get current battery percentage.
+
+        Returns:
+            Battery percentage (0-100), or -1 if unavailable
+        """
+        return getattr(self, '_battery_percent', -1.0)
+
+    def hold_position(self):
+        """Command vehicle to hold current position.
+
+        Sends zero velocity command to maintain position.
+        """
+        self.send_velocity(0, 0, 0, 0)
 
     # =========================================================================
     # Velocity Commands

@@ -84,26 +84,46 @@ class AeroSyncConfig:
 
 @dataclass
 class Job:
-    """Job data from AeroSync."""
+    """Job data from AeroSync.
+
+    Matches AEROSYNC_SPEC.md GET /api/drone/jobs/{job_id} response format.
+    """
     job_id: str
     name: str
     search_pattern: str
+    search_area: dict                   # GeoJSON polygon
     search_config: dict
     stop_conditions: dict
     inspection_config: dict
     previously_inspected: List[dict]
+    state: str = 'pending'              # pending, running, completed, aborted
 
     @classmethod
     def from_dict(cls, data: dict) -> 'Job':
         return cls(
-            job_id=data.get('job_id', ''),
+            job_id=data.get('job_id', data.get('id', '')),
             name=data.get('name', ''),
             search_pattern=data.get('search_pattern', 'line_follow'),
+            search_area=data.get('search_area', {}),
             search_config=data.get('search_config', {}),
             stop_conditions=data.get('stop_conditions', {}),
             inspection_config=data.get('inspection_config', {}),
-            previously_inspected=data.get('previously_inspected', [])
+            previously_inspected=data.get('previously_inspected', []),
+            state=data.get('state', 'pending')
         )
+
+    def to_mission_dict(self) -> dict:
+        """Convert to dict format expected by mission_planner.parse_mission()."""
+        return {
+            'job_id': self.job_id,
+            'name': self.name,
+            'search_pattern': self.search_pattern,
+            'search_area': self.search_area,
+            'search_config': self.search_config,
+            'stop_conditions': self.stop_conditions,
+            'inspection_config': self.inspection_config,
+            'previously_inspected': self.previously_inspected
+        }
 
 
 # =============================================================================
@@ -225,7 +245,7 @@ class AeroSyncClient:
             Job object or None if failed
         """
         try:
-            url = f"{self.config.base_url}/api/jobs/{job_id}"
+            url = f"{self.config.base_url}/api/drone/jobs/{job_id}"
             response = self._request_with_retry('GET', url)
             data = response.json()
             return Job.from_dict(data)
@@ -244,7 +264,7 @@ class AeroSyncClient:
             True if successful
         """
         try:
-            url = f"{self.config.base_url}/api/jobs/{job_id}/start"
+            url = f"{self.config.base_url}/api/drone/jobs/{job_id}/start"
             self._request_with_retry('POST', url)
             return True
 
@@ -263,18 +283,20 @@ class AeroSyncClient:
             Pole UUID from server or None if failed
         """
         try:
-            url = f"{self.config.base_url}/api/jobs/{job_id}/poles"
+            url = f"{self.config.base_url}/api/drone/jobs/{job_id}/poles"
 
+            # Match AEROSYNC_SPEC.md POST /api/drone/jobs/{job_id}/poles format
             payload = {
                 'pole_id': result.global_pole_id,
                 'timestamp': result.timestamp_iso,
                 'position': {
                     'latitude': result.position_gps[0],
                     'longitude': result.position_gps[1],
-                    'altitude_msl': result.position_gps[2],
-                    'local_x': result.position_local[0],
-                    'local_y': result.position_local[1],
-                    'local_z': result.position_local[2]
+                    'altitude_msl': result.position_gps[2] if len(result.position_gps) > 2 else 0,
+                    'altitude_agl': getattr(result, 'altitude_agl', result.position_local[2] if result.position_local else 0),
+                    'local_x': result.position_local[0] if result.position_local else 0,
+                    'local_y': result.position_local[1] if result.position_local else 0,
+                    'local_z': result.position_local[2] if result.position_local else 0
                 },
                 'detection': {
                     'confidence': result.confidence,
@@ -284,7 +306,7 @@ class AeroSyncClient:
                     'height_estimate': result.pole_height,
                     'radius_estimate': result.pole_radius
                 },
-                'metadata': result.metadata
+                'metadata': result.metadata if hasattr(result, 'metadata') else {}
             }
 
             response = self._request_with_retry('POST', url, json=payload)
@@ -296,7 +318,7 @@ class AeroSyncClient:
             return None
 
     def upload_photo(self, job_id: str, pole_id: str, photo_path: str) -> Optional[str]:
-        """Upload a pole photo to AeroSync.
+        """Upload a pole photo to AeroSync (direct upload).
 
         Args:
             job_id: Job UUID
@@ -310,7 +332,7 @@ class AeroSyncClient:
             return None
 
         try:
-            url = f"{self.config.base_url}/api/jobs/{job_id}/poles/{pole_id}/photo"
+            url = f"{self.config.base_url}/api/drone/jobs/{job_id}/poles/{pole_id}/photo"
 
             with open(photo_path, 'rb') as f:
                 files = {'photo': (photo_path.split('/')[-1], f, 'image/jpeg')}
@@ -333,6 +355,170 @@ class AeroSyncClient:
             print(f"Failed to upload photo: {e}")
             return None
 
+    # =========================================================================
+    # S3 Presigned URL Upload (Alternative to Direct Upload)
+    # =========================================================================
+
+    def get_photo_upload_url(self, job_id: str, pole_id: str) -> Optional[dict]:
+        """Request S3 presigned URL for photo upload.
+
+        This is the first step of the S3 upload flow:
+        1. Request presigned URL from AeroSync
+        2. Upload directly to S3
+        3. Confirm upload with AeroSync
+
+        Args:
+            job_id: Job UUID
+            pole_id: Pole UUID
+
+        Returns:
+            Dict with upload_url, photo_id, s3_key, expires_in
+            or None if failed
+        """
+        try:
+            url = f"{self.config.base_url}/api/drone/jobs/{job_id}/poles/{pole_id}/photo/upload-url"
+            response = self._request_with_retry('GET', url)
+            return response.json()
+
+        except Exception as e:
+            print(f"Failed to get upload URL: {e}")
+            return None
+
+    def upload_to_s3(self, upload_url: str, image_data: bytes) -> bool:
+        """Upload photo directly to S3 using presigned URL.
+
+        Args:
+            upload_url: S3 presigned URL from get_photo_upload_url()
+            image_data: JPEG image bytes
+
+        Returns:
+            True if upload successful
+        """
+        if not REQUESTS_AVAILABLE:
+            print("requests library not available")
+            return False
+
+        try:
+            # Direct PUT to S3 with presigned URL
+            response = requests.put(
+                upload_url,
+                data=image_data,
+                headers={'Content-Type': 'image/jpeg'},
+                timeout=60.0  # Longer timeout for large uploads
+            )
+
+            return response.status_code == 200
+
+        except Exception as e:
+            print(f"S3 upload failed: {e}")
+            return False
+
+    def confirm_photo_upload(self, job_id: str, pole_id: str,
+                              photo_id: str, s3_key: str) -> bool:
+        """Confirm photo upload completion to AeroSync.
+
+        This is the final step after uploading to S3.
+
+        Args:
+            job_id: Job UUID
+            pole_id: Pole UUID
+            photo_id: Photo ID from get_photo_upload_url()
+            s3_key: S3 key from get_photo_upload_url()
+
+        Returns:
+            True if confirmation successful
+        """
+        try:
+            url = f"{self.config.base_url}/api/drone/jobs/{job_id}/poles/{pole_id}/photo/confirm"
+            payload = {'photo_id': photo_id, 's3_key': s3_key}
+            self._request_with_retry('POST', url, json=payload)
+            return True
+
+        except Exception as e:
+            print(f"Upload confirmation failed: {e}")
+            return False
+
+    def upload_photo_s3(self, job_id: str, pole_id: str,
+                         image_data: bytes,
+                         max_retries: int = 3) -> Optional[str]:
+        """Complete S3 upload flow with retry logic.
+
+        Performs the full 3-step S3 upload:
+        1. Get presigned URL
+        2. Upload to S3
+        3. Confirm upload
+
+        Args:
+            job_id: Job UUID
+            pole_id: Pole UUID
+            image_data: JPEG image bytes
+            max_retries: Number of retry attempts
+
+        Returns:
+            Photo ID if successful, None otherwise
+        """
+        if not self.config.upload_photos:
+            return None
+
+        for attempt in range(max_retries):
+            try:
+                # 1. Get presigned URL
+                upload_info = self.get_photo_upload_url(job_id, pole_id)
+                if not upload_info:
+                    raise Exception("Failed to get upload URL")
+
+                # 2. Upload to S3
+                success = self.upload_to_s3(upload_info['upload_url'], image_data)
+                if not success:
+                    raise Exception("S3 upload failed")
+
+                # 3. Confirm upload
+                confirmed = self.confirm_photo_upload(
+                    job_id, pole_id,
+                    upload_info['photo_id'],
+                    upload_info['s3_key']
+                )
+                if not confirmed:
+                    raise Exception("Upload confirmation failed")
+
+                print(f"Photo uploaded successfully: {upload_info['photo_id']}")
+                return upload_info['photo_id']
+
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    print(f"Photo upload failed after {max_retries} attempts: {e}")
+                    return None
+
+                # Exponential backoff
+                delay = self.config.retry_base_delay * (2 ** attempt)
+                print(f"Upload attempt {attempt + 1} failed, retrying in {delay}s...")
+                time.sleep(delay)
+
+        return None
+
+    def upload_photo_from_file_s3(self, job_id: str, pole_id: str,
+                                   photo_path: str) -> Optional[str]:
+        """Upload photo file using S3 presigned URL flow.
+
+        Convenience wrapper that reads a file and uploads via S3.
+
+        Args:
+            job_id: Job UUID
+            pole_id: Pole UUID
+            photo_path: Local path to JPEG file
+
+        Returns:
+            Photo ID if successful, None otherwise
+        """
+        try:
+            with open(photo_path, 'rb') as f:
+                image_data = f.read()
+            return self.upload_photo_s3(job_id, pole_id, image_data)
+
+        except Exception as e:
+            print(f"Failed to read photo file: {e}")
+            return None
+
     def update_status(self, job_id: str, status: 'MissionStatus') -> bool:
         """Update mission status on AeroSync.
 
@@ -344,15 +530,18 @@ class AeroSyncClient:
             True if successful
         """
         try:
-            url = f"{self.config.base_url}/api/jobs/{job_id}/status"
+            url = f"{self.config.base_url}/api/drone/jobs/{job_id}/status"
 
+            # Match AEROSYNC_SPEC.md format
             payload = {
-                'state': status.state.value,
+                'state': status.state.value if hasattr(status.state, 'value') else str(status.state),
+                'guidance_state': getattr(status, 'guidance_state', 'FOLLOW'),
                 'poles_inspected': status.poles_inspected,
                 'elapsed_minutes': status.elapsed_minutes,
                 'battery_percent': status.battery_percent,
+                'coverage_percent': status.coverage_percent,
                 'distance_from_home': status.distance_from_home,
-                'coverage_percent': status.coverage_percent
+                'current_position': getattr(status, 'current_position', None)
             }
 
             self._request_with_retry('PUT', url, json=payload)
@@ -373,8 +562,18 @@ class AeroSyncClient:
             True if successful
         """
         try:
-            url = f"{self.config.base_url}/api/jobs/{job_id}/complete"
-            payload = summary.to_dict()
+            url = f"{self.config.base_url}/api/drone/jobs/{job_id}/complete"
+            # Match AEROSYNC_SPEC.md format
+            payload = {
+                'stop_reason': getattr(summary, 'stop_reason', 'completed'),
+                'summary': summary.to_dict() if hasattr(summary, 'to_dict') else {
+                    'poles_inspected': getattr(summary, 'poles_inspected', 0),
+                    'poles_skipped_duplicate': getattr(summary, 'poles_skipped_duplicate', 0),
+                    'duration_minutes': getattr(summary, 'duration_minutes', 0),
+                    'final_battery_percent': getattr(summary, 'final_battery_percent', 0),
+                    'final_coverage_percent': getattr(summary, 'final_coverage_percent', 0)
+                }
+            }
             self._request_with_retry('POST', url, json=payload)
             return True
 
@@ -432,8 +631,11 @@ class AeroSyncClient:
 
     async def _ws_handler(self, job_id: str):
         """Async WebSocket handler."""
+        # WebSocket endpoint - AeroSync uses Socket.IO on root
         ws_url = self.config.base_url.replace('https://', 'wss://').replace('http://', 'ws://')
-        ws_url = f"{ws_url}/api/jobs/{job_id}/live"
+        # Socket.IO connects to root, then joins rooms via events
+        # For raw WebSocket fallback, use the job-specific endpoint
+        ws_url = f"{ws_url}/socket.io/?job_id={job_id}&type=drone"
 
         headers = {'Authorization': f'Bearer {self.config.api_key}'}
 
@@ -479,48 +681,79 @@ class AeroSyncClient:
                 print(f"WebSocket send error: {e}")
 
     async def _handle_ws_message(self, data: str):
-        """Handle incoming WebSocket message."""
+        """Handle incoming WebSocket message.
+
+        Handles Socket.IO style events from AEROSYNC_SPEC.md:
+        - abort: Operator requested mission abort
+        - pause: Operator requested pause (custom)
+        - resume: Operator requested resume (custom)
+        """
         try:
             msg = json.loads(data)
-            msg_type = msg.get('type', '')
 
-            if msg_type == 'pause_mission':
-                if self._on_pause:
-                    self._on_pause()
+            # Socket.IO messages may have 'event' or 'type' field
+            event = msg.get('event', msg.get('type', ''))
 
-            elif msg_type == 'resume_mission':
-                if self._on_resume:
-                    self._on_resume()
-
-            elif msg_type == 'abort_mission':
+            # Handle abort command (AEROSYNC_SPEC: Server → Drone)
+            if event == 'abort':
+                print("Received abort command from AeroSync")
                 if self._on_abort:
                     self._on_abort()
 
-            elif msg_type == 'update_stop_conditions':
+            # Handle pause (custom extension)
+            elif event in ('pause', 'pause_mission'):
+                print("Received pause command from AeroSync")
+                if self._on_pause:
+                    self._on_pause()
+
+            # Handle resume (custom extension)
+            elif event in ('resume', 'resume_mission'):
+                print("Received resume command from AeroSync")
+                if self._on_resume:
+                    self._on_resume()
+
+            # Handle stop conditions update (custom extension)
+            elif event == 'update_stop_conditions':
                 if self._on_update_conditions:
-                    self._on_update_conditions(msg.get('conditions', {}))
+                    self._on_update_conditions(msg.get('conditions', msg.get('data', {})))
+
+            # Handle connected acknowledgment
+            elif event == 'connected':
+                print(f"WebSocket connected, sid: {msg.get('sid', 'unknown')}")
+
+            # Handle joined acknowledgment
+            elif event == 'joined':
+                print(f"Joined job room: {msg.get('room', 'unknown')}")
 
         except json.JSONDecodeError:
             pass
 
     def send_position(self, lat: float, lon: float, alt: float,
-                      heading: float, speed: float):
+                      heading: float, speed: float,
+                      battery: float = -1.0, job_id: str = ''):
         """Queue position update for WebSocket.
+
+        Matches AEROSYNC_SPEC.md 'drone_position' event format.
 
         Args:
             lat: Latitude (degrees)
             lon: Longitude (degrees)
-            alt: Altitude MSL (meters)
-            heading: Heading (degrees)
+            alt: Altitude AGL (meters)
+            heading: Heading (degrees, 0=North)
             speed: Ground speed (m/s)
+            battery: Battery percentage (0-100)
+            job_id: Job UUID (optional, for context)
         """
+        # Match AEROSYNC_SPEC.md drone_position event format
         self._ws_queue.put({
-            'type': 'position_update',
+            'event': 'drone_position',
+            'job_id': job_id,
             'lat': lat,
             'lon': lon,
             'alt': alt,
             'heading': heading,
             'speed': speed,
+            'battery': battery,
             'timestamp': time.time()
         })
 
