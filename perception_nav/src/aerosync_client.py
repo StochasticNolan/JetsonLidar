@@ -414,7 +414,11 @@ class AeroSyncClient:
             return False
 
     def confirm_photo_upload(self, job_id: str, pole_id: str,
-                              photo_id: str, s3_key: str) -> bool:
+                              photo_id: str, s3_key: str,
+                              pole_lat: float = None, pole_lon: float = None,
+                              drone_lat: float = None, drone_lon: float = None,
+                              drone_alt: float = None, drone_heading: float = None,
+                              captured_at: str = None) -> bool:
         """Confirm photo upload completion to AeroSync.
 
         This is the final step after uploading to S3.
@@ -424,13 +428,32 @@ class AeroSyncClient:
             pole_id: Pole UUID
             photo_id: Photo ID from get_photo_upload_url()
             s3_key: S3 key from get_photo_upload_url()
+            pole_lat: Pole GPS latitude (optional)
+            pole_lon: Pole GPS longitude (optional)
+            drone_lat: Drone latitude at capture time
+            drone_lon: Drone longitude at capture time
+            drone_alt: Drone altitude AGL at capture time
+            drone_heading: Drone heading in degrees at capture time
+            captured_at: ISO8601 timestamp of capture
 
         Returns:
             True if confirmation successful
         """
         try:
             url = f"{self.config.base_url}/api/drone/jobs/{job_id}/poles/{pole_id}/photo/confirm"
-            payload = {'photo_id': photo_id, 's3_key': s3_key}
+            payload = {
+                'photo_id': photo_id,
+                's3_key': s3_key,
+                'lat': pole_lat,
+                'lon': pole_lon,
+                'drone_lat': drone_lat,
+                'drone_lon': drone_lon,
+                'drone_alt': drone_alt,
+                'drone_heading': drone_heading,
+                'captured_at': captured_at
+            }
+            # Remove None values
+            payload = {k: v for k, v in payload.items() if v is not None}
             self._request_with_retry('POST', url, json=payload)
             return True
 
@@ -440,18 +463,29 @@ class AeroSyncClient:
 
     def upload_photo_s3(self, job_id: str, pole_id: str,
                          image_data: bytes,
+                         pole_lat: float = None, pole_lon: float = None,
+                         drone_lat: float = None, drone_lon: float = None,
+                         drone_alt: float = None, drone_heading: float = None,
+                         captured_at: str = None,
                          max_retries: int = 3) -> Optional[str]:
         """Complete S3 upload flow with retry logic.
 
         Performs the full 3-step S3 upload:
         1. Get presigned URL
         2. Upload to S3
-        3. Confirm upload
+        3. Confirm upload with drone position metadata
 
         Args:
             job_id: Job UUID
             pole_id: Pole UUID
             image_data: JPEG image bytes
+            pole_lat: Pole GPS latitude (optional)
+            pole_lon: Pole GPS longitude (optional)
+            drone_lat: Drone latitude at capture time
+            drone_lon: Drone longitude at capture time
+            drone_alt: Drone altitude AGL at capture time
+            drone_heading: Drone heading in degrees at capture time
+            captured_at: ISO8601 timestamp of capture
             max_retries: Number of retry attempts
 
         Returns:
@@ -472,11 +506,18 @@ class AeroSyncClient:
                 if not success:
                     raise Exception("S3 upload failed")
 
-                # 3. Confirm upload
+                # 3. Confirm upload with drone metadata
                 confirmed = self.confirm_photo_upload(
                     job_id, pole_id,
                     upload_info['photo_id'],
-                    upload_info['s3_key']
+                    upload_info['s3_key'],
+                    pole_lat=pole_lat,
+                    pole_lon=pole_lon,
+                    drone_lat=drone_lat,
+                    drone_lon=drone_lon,
+                    drone_alt=drone_alt,
+                    drone_heading=drone_heading,
+                    captured_at=captured_at
                 )
                 if not confirmed:
                     raise Exception("Upload confirmation failed")
