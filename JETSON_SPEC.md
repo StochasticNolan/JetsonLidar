@@ -1,6 +1,6 @@
 # Jetson Drone Code Specification
 
-**Version:** 1.1
+**Version:** 1.3
 **Last Updated:** January 16, 2026 (Integration Testing Complete)
 
 ## AeroSync Integration Status (Jan 16, 2026)
