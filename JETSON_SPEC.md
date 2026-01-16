@@ -3,6 +3,25 @@
 **Version:** 1.0
 **Last Updated:** January 16, 2026
 
+## AeroSync Integration Status (Jan 16, 2026)
+
+### ✅ AeroSync Backend Ready
+- **Database Schema** - All mission fields added to `jobs` table
+- **REST API** - All 11 drone endpoints operational (`/api/drone/*`)
+- **WebSocket Server** - Real-time events configured (position, poles, photos, status)
+- **Mission Creation** - `POST /api/jobs` endpoint accepts all mission parameters
+- **Server Running** - localhost:8000 ready for Jetson integration
+
+### 📋 Jetson Development Tasks
+- **Priority 1:** Mission parser to fetch job config from AeroSync
+- **Priority 2:** WebSocket client for real-time position broadcast
+- **Priority 3:** Photo upload pipeline using S3 presigned URLs
+- **Priority 4:** Flight control integration for autonomous navigation
+
+See [AEROSYNC_SPEC.md](./AEROSYNC_SPEC.md) for complete API reference.
+
+---
+
 ## Overview
 
 JetsonLidar is the autonomous drone perception and navigation system running on NVIDIA Jetson hardware. It handles:
